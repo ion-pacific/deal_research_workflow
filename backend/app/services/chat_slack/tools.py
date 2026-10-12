@@ -15,7 +15,8 @@ Reuses (don't reinvent):
 from __future__ import annotations
 
 import re
-from typing import Any
+from datetime import date
+from typing import Any, Literal
 
 import psycopg2.extras
 from pydantic import BaseModel, Field
@@ -1971,6 +1972,543 @@ def get_fund_status(inp: FundStatusInput, ctx: dict) -> ToolResult:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Email correspondence (dce's email pipeline, see memory:
+# deal_cloud_email_pipeline). dealcloud.email_thread holds ONLY promoted,
+# deal-related threads, each with an LLM summary -- raw bodies never leave
+# dce's transient staging table, so there is nothing more to read than what
+# these tools return. The get_org_* tools above already roll email into
+# per-org aggregates; these three are the thread- and person-level view:
+# search threads, open one, and look a correspondent up by name/address.
+# ---------------------------------------------------------------------------
+
+EmailCategory = Literal[
+    "inbound_deal_inquiry", "outbound_outreach", "ongoing_deal_discussion",
+    "portfolio_update", "deal_admin",
+]
+
+_EMAIL_PREVIEW_CHARS = 600
+_EMAIL_SEARCH_INTERNAL_CAP = 5
+_EMAIL_SEARCH_EXTERNAL_CAP = 8
+_EMAIL_SEARCH_ORG_CAP = 6
+_EMAIL_READ_PARTICIPANT_CAP = 60
+_EMAIL_READ_MESSAGE_CAP = 40
+_EMAIL_CONTACT_ION_CAP = 5
+_EMAIL_CONTACT_ORG_CAP = 3
+
+_TERM_RE = re.compile(r'"([^"]+)"|(\S+)')
+
+
+def _like(term: str) -> str:
+    """ILIKE pattern for a literal substring (escapes %, _ and backslash)."""
+    esc = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{esc}%"
+
+
+def _split_terms(text: str | None) -> list[str]:
+    """Whitespace-split, keeping "quoted phrases" together."""
+    if not text:
+        return []
+    return [a or b for a, b in _TERM_RE.findall(text) if (a or b).strip()]
+
+
+def _email_direction(row: dict) -> str:
+    """Same badges dce's Emails tab shows."""
+    if row.get("was_initiated_internally"):
+        return "we -> them" if row.get("has_external_response") else "we wrote, no reply"
+    if row.get("was_initiated_internally") is False:
+        return "they -> us" if row.get("has_internal_response") else "they wrote, no reply"
+    return "unknown"
+
+
+def _email_coverage(cur) -> dict:
+    cur.execute(
+        "SELECT MIN(last_message_at)::date AS earliest, "
+        "       MAX(last_message_at)::date AS latest, COUNT(*) AS threads "
+        "  FROM dealcloud.email_thread"
+    )
+    return dict(cur.fetchone())
+
+
+def _email_note(coverage: dict) -> str:
+    # Lives in the RESPONSE, not the description: the window moves every
+    # weekly sync (see chat_mcp_tools' "Writing tool descriptions").
+    return (
+        f"Email index covers {coverage['threads']} deal-related threads "
+        f"from {coverage['earliest']} to {coverage['latest']}. Only threads "
+        "an LLM triage judged deal-related were kept (personal, newsletter, "
+        "vendor, recruiter and internal-ops mail is dropped), and only a "
+        "summary is stored -- never the email body. So 'no thread found' "
+        "means no deal-related thread was indexed in that window, not proof "
+        "that nobody ever emailed them; older contact may still show up in "
+        "get_org_communication_timeline (DealCloud activities, calendar)."
+    )
+
+
+class SearchEmailThreadsInput(BaseModel):
+    query: str | None = Field(
+        None,
+        max_length=200,
+        description=(
+            "Keywords matched literally (case-insensitive) against each "
+            "thread's subject and summary. Every word must appear; wrap a "
+            "phrase in double quotes to match it as-is, e.g. "
+            "'\"term sheet\" Series B'. Not semantic -- use the words a "
+            "summary would actually contain."
+        ),
+    )
+    org_ids: list[int] = Field(
+        default_factory=list, max_length=20,
+        description=(
+            "Restrict to threads attributed to these orgs. Pass canonical "
+            "heads from find_organizations / bundle_via_supersede. Not every "
+            "thread is attributed to an org, so if this comes back thin, "
+            "retry with `participant` set to the org's email domain."
+        ),
+    )
+    participant: str | None = Field(
+        None, max_length=200,
+        description=(
+            "An EXTERNAL correspondent on the thread: a name, an email "
+            "address, or a domain ('sequoiacap.com'). Substring match."
+        ),
+    )
+    ion_person: str | None = Field(
+        None, max_length=200,
+        description=(
+            "An Ion Pacific person on the thread: a name or "
+            "@ionpacific.com address. Substring match."
+        ),
+    )
+    categories: list[EmailCategory] = Field(
+        default_factory=list,
+        description=(
+            "Restrict to these triage categories. Empty = all. "
+            "inbound_deal_inquiry (they pitched/asked us), outbound_outreach "
+            "(we reached out), ongoing_deal_discussion, portfolio_update, "
+            "deal_admin (legal/fund-admin/closing logistics)."
+        ),
+    )
+    since: date | None = Field(
+        None, description="Only threads active on or after this date (YYYY-MM-DD)."
+    )
+    until: date | None = Field(
+        None, description="Only threads that started on or before this date (YYYY-MM-DD)."
+    )
+    limit: int = Field(15, ge=1, le=50, description="Max threads to return.")
+    offset: int = Field(0, ge=0, description="For paging through `total_matches`.")
+
+
+class EmailThreadIdInput(BaseModel):
+    thread_id: int = Field(
+        ..., description="dealcloud.email_thread.id, from search_email_threads or get_org_dossier."
+    )
+
+
+class FindEmailContactsInput(BaseModel):
+    query: str = Field(
+        ..., min_length=2, max_length=200,
+        description=(
+            "A person's name, an email address, or a domain "
+            "('@a16z.com', 'a16z.com'). Every word must match the "
+            "correspondent's name or address (substring, case-insensitive)."
+        ),
+    )
+    include_internal: bool = Field(
+        False,
+        description="Also return Ion Pacific people. Default: external correspondents only.",
+    )
+    limit: int = Field(15, ge=1, le=50, description="Max people to return.")
+
+
+@slack_registry.tool(
+    "search_email_threads",
+    (
+        "Search Ion Pacific's indexed EMAIL correspondence -- deal-related "
+        "threads from Ion staff mailboxes, each stored as an LLM summary "
+        "with its participants and the orgs it concerns. Use for 'what did "
+        "we discuss with X', 'when did we last email them about Y', 'who "
+        "pitched us on Z', 'which threads mention a term sheet', or 'what "
+        "has <Ion person> been corresponding with <company> about'. "
+        "Combine any of: keywords, org_ids, an external participant "
+        "(name/address/domain), an Ion person, categories and a date "
+        "range; at least one filter is required. Newest first, with "
+        "`total_matches` for paging. Each row has thread_id, subject, "
+        "dates, direction, category, a summary preview, the Ion and "
+        "external participants, and the attributed orgs. Call "
+        "read_email_thread for the full summary and message timeline. "
+        "For an org-level overview prefer get_org_communication_timeline "
+        "/ get_org_their_contacts; this tool is for the threads themselves. "
+        "Read-only."
+    ),
+    SearchEmailThreadsInput,
+)
+def search_email_threads(inp: SearchEmailThreadsInput, ctx: dict) -> ToolResult:
+    terms = _split_terms(inp.query)
+    if not (terms or inp.org_ids or inp.participant or inp.ion_person
+            or inp.categories or inp.since or inp.until):
+        return ToolResult(output=(
+            "Give at least one filter: query, org_ids, participant, "
+            "ion_person, categories, since or until."
+        ))
+
+    where, params = [], []
+    for t in terms:
+        where.append(
+            "(COALESCE(et.subject, '') || ' ' || COALESCE(et.summary, '')) ILIKE %s"
+        )
+        params.append(_like(t))
+    if inp.org_ids:
+        where.append(
+            "EXISTS (SELECT 1 FROM dealcloud.organization_entity oe "
+            "         WHERE oe.entity_type = 'email_thread' "
+            "           AND oe.entity_id = et.id "
+            "           AND oe.organization_id = ANY(%s))"
+        )
+        params.append(inp.org_ids)
+    for who, internal in ((inp.participant, False), (inp.ion_person, True)):
+        if who and who.strip():
+            where.append(
+                "EXISTS (SELECT 1 FROM dealcloud.email_thread_participant p "
+                "         WHERE p.thread_id = et.id AND p.is_internal = %s "
+                "           AND (p.email ILIKE %s OR p.name ILIKE %s))"
+            )
+            pat = _like(who.strip())
+            params += [internal, pat, pat]
+    if inp.categories:
+        where.append("et.category = ANY(%s)")
+        params.append(list(inp.categories))
+    if inp.since:
+        where.append("et.last_message_at >= %s")
+        params.append(inp.since)
+    if inp.until:
+        where.append("et.first_message_at < %s::date + 1")
+        params.append(inp.until)
+
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            f"""
+            SELECT et.id AS thread_id, et.subject,
+                   et.first_message_at::date AS first_message_at,
+                   et.last_message_at::date  AS last_message_at,
+                   et.message_count, et.category,
+                   et.was_initiated_internally, et.has_internal_response,
+                   et.has_external_response,
+                   LEFT(COALESCE(et.summary, ''), %s) AS summary_preview,
+                   LENGTH(COALESCE(et.summary, '')) > %s AS summary_truncated,
+                   COUNT(*) OVER () AS total_matches
+              FROM dealcloud.email_thread et
+             WHERE {' AND '.join(where)}
+             ORDER BY et.last_message_at DESC, et.id DESC
+             LIMIT %s OFFSET %s
+            """,
+            [_EMAIL_PREVIEW_CHARS, _EMAIL_PREVIEW_CHARS, *params,
+             inp.limit, inp.offset],
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        total = rows[0]["total_matches"] if rows else 0
+        ids = [r["thread_id"] for r in rows]
+
+        people: dict[int, dict[str, list]] = {}
+        orgs: dict[int, list] = {}
+        if ids:
+            cur.execute(
+                """
+                SELECT thread_id, email, name, is_internal
+                  FROM dealcloud.email_thread_participant
+                 WHERE thread_id = ANY(%s)
+                 ORDER BY thread_id, is_initiator DESC, message_count DESC, email
+                """,
+                (ids,),
+            )
+            for p in cur.fetchall():
+                side = "ion" if p["is_internal"] else "external"
+                bucket = people.setdefault(p["thread_id"], {"ion": [], "external": []})[side]
+                cap = _EMAIL_SEARCH_INTERNAL_CAP if p["is_internal"] else _EMAIL_SEARCH_EXTERNAL_CAP
+                if len(bucket) < cap:
+                    bucket.append(
+                        f"{p['name']} <{p['email']}>" if p["name"] else p["email"]
+                    )
+            cur.execute(
+                """
+                SELECT DISTINCT ON (oe.entity_id, o.id)
+                       oe.entity_id AS thread_id, o.id AS org_id, o.name,
+                       oe.relationship_type
+                  FROM dealcloud.organization_entity oe
+                  JOIN dealcloud.organization o ON o.id = oe.organization_id
+                 WHERE oe.entity_type = 'email_thread' AND oe.entity_id = ANY(%s)
+                 ORDER BY oe.entity_id, o.id
+                """,
+                (ids,),
+            )
+            for o in cur.fetchall():
+                lst = orgs.setdefault(o["thread_id"], [])
+                if len(lst) < _EMAIL_SEARCH_ORG_CAP:
+                    lst.append({"org_id": o["org_id"], "name": o["name"],
+                                "relationship": o["relationship_type"]})
+        coverage = _email_coverage(cur)
+
+    results = []
+    for r in rows:
+        p = people.get(r["thread_id"], {"ion": [], "external": []})
+        results.append({
+            "thread_id":        r["thread_id"],
+            "subject":          r["subject"],
+            "first_message_at": r["first_message_at"],
+            "last_message_at":  r["last_message_at"],
+            "message_count":    r["message_count"],
+            "direction":        _email_direction(r),
+            "category":         r["category"],
+            "summary_preview":  r["summary_preview"]
+                                + ("..." if r["summary_truncated"] else ""),
+            "ion_participants":      p["ion"],
+            "external_participants": p["external"],
+            "orgs":             orgs.get(r["thread_id"], []),
+        })
+    return ToolResult(output={
+        "total_matches": total,
+        "returned": len(results),
+        "offset": inp.offset,
+        "results": results,
+        "note": _email_note(coverage),
+    })
+
+
+@slack_registry.tool(
+    "read_email_thread",
+    (
+        "Open ONE email thread: its full LLM summary, every participant "
+        "(Ion vs external, who started it, how many messages each sent), "
+        "the orgs it concerns with the role each plays and why, and the "
+        "message-by-message timeline (who sent what when, inbound or "
+        "outbound). This is everything stored about a thread -- email "
+        "bodies are not kept, so if the summary doesn't answer the "
+        "question, say so rather than guessing at what was written. "
+        "Read-only."
+    ),
+    EmailThreadIdInput,
+)
+def read_email_thread(inp: EmailThreadIdInput, ctx: dict) -> ToolResult:
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            """
+            SELECT id AS thread_id, subject, first_message_at, last_message_at,
+                   message_count, category, was_initiated_internally,
+                   has_internal_response, has_external_response, summary
+              FROM dealcloud.email_thread WHERE id = %s
+            """,
+            (inp.thread_id,),
+        )
+        t = cur.fetchone()
+        if t is None:
+            return ToolResult(output=f"Email thread {inp.thread_id} not found.")
+        t = dict(t)
+
+        cur.execute(
+            """
+            SELECT email, NULLIF(name, '') AS name, is_internal AS is_ion,
+                   is_initiator,
+                   message_count, contact_id IS NOT NULL AS in_dealcloud
+              FROM dealcloud.email_thread_participant
+             WHERE thread_id = %s
+             ORDER BY is_initiator DESC, is_internal, message_count DESC, email
+            """,
+            (inp.thread_id,),
+        )
+        participants = [dict(r) for r in cur.fetchall()]
+
+        cur.execute(
+            """
+            SELECT DISTINCT ON (o.id)
+                   o.id AS org_id, o.name, oe.relationship_type, oe.context
+              FROM dealcloud.organization_entity oe
+              JOIN dealcloud.organization o ON o.id = oe.organization_id
+             WHERE oe.entity_type = 'email_thread' AND oe.entity_id = %s
+             ORDER BY o.id, oe.context IS NULL
+            """,
+            (inp.thread_id,),
+        )
+        thread_orgs = [dict(r) for r in cur.fetchall()]
+
+        # The same message is stored once per mailbox it sits in (sender's
+        # Sent + each Ion recipient's Inbox), so collapse on internet_msg_id.
+        cur.execute(
+            """
+            SELECT sent_at, sender_email, sender_is_internal, direction
+              FROM (
+                SELECT DISTINCT ON (COALESCE(internet_msg_id, graph_message_id))
+                       sent_at, sender_email, sender_is_internal, direction
+                  FROM dealcloud.email_message
+                 WHERE thread_id = %s
+                 ORDER BY COALESCE(internet_msg_id, graph_message_id),
+                          (folder ILIKE 'sent%%') DESC
+              ) m
+             ORDER BY sent_at
+            """,
+            (inp.thread_id,),
+        )
+        messages = [dict(r) for r in cur.fetchall()]
+        coverage = _email_coverage(cur)
+
+    names = {p["email"].lower(): p["name"] for p in participants if p["name"]}
+    shown = messages[-_EMAIL_READ_MESSAGE_CAP:]
+    timeline = [{
+        "sent_at":    m["sent_at"],
+        "from":       names.get((m["sender_email"] or "").lower(), m["sender_email"]),
+        "from_email": m["sender_email"],
+        "from_ion":   m["sender_is_internal"],
+        "direction":  m["direction"],
+    } for m in shown]
+
+    return ToolResult(output={
+        "thread_id":        t["thread_id"],
+        "subject":          t["subject"],
+        "first_message_at": t["first_message_at"],
+        "last_message_at":  t["last_message_at"],
+        "message_count":    t["message_count"],
+        "direction":        _email_direction(t),
+        "category":         t["category"],
+        "summary":          t["summary"] or "(no summary)",
+        "participants":     participants[:_EMAIL_READ_PARTICIPANT_CAP],
+        "participants_omitted": max(0, len(participants) - _EMAIL_READ_PARTICIPANT_CAP),
+        "orgs":             thread_orgs,
+        "timeline":         timeline,
+        "timeline_omitted_earlier": len(messages) - len(shown),
+        "note":             _email_note(coverage),
+    })
+
+
+@slack_registry.tool(
+    "find_email_contacts",
+    (
+        "Look up PEOPLE Ion Pacific has corresponded with by email, by "
+        "name, address or domain -- 'have we been in touch with Jane Doe', "
+        "'who have we emailed at a16z.com', 'what's John's email at Acme'. "
+        "For each person returns their address and name, how many indexed "
+        "threads they appear on and when (first/last), which Ion people "
+        "they corresponded with most, and the orgs they're associated "
+        "with (job title, relationship strength, whether they're a "
+        "DealCloud contact). An org with domain_match=true is one their "
+        "email domain belongs to -- their employer; the rest are orgs "
+        "their threads were about, so don't present those as where the "
+        "person works. Ranked by number of threads. Pass a "
+        "person's address to search_email_threads(participant=...) to see "
+        "the threads themselves. When you already have an org_id, "
+        "get_org_their_contacts is the org-centric version. Read-only."
+    ),
+    FindEmailContactsInput,
+)
+def find_email_contacts(inp: FindEmailContactsInput, ctx: dict) -> ToolResult:
+    terms = [t.lstrip("@") for t in _split_terms(inp.query)]
+    terms = [t for t in terms if t]
+    if not terms:
+        return ToolResult(output="Give a name, email address or domain to look up.")
+    where = ["(p.email ILIKE %s OR p.name ILIKE %s)"] * len(terms)
+    params: list[Any] = [x for t in terms for x in (_like(t), _like(t))]
+    if not inp.include_internal:
+        where.append("NOT p.is_internal")
+
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            f"""
+            WITH m AS (
+                SELECT LOWER(p.email) AS email, p.name, p.is_internal,
+                       p.thread_id, p.message_count
+                  FROM dealcloud.email_thread_participant p
+                 WHERE {' AND '.join(where)}
+            )
+            SELECT m.email,
+                   MODE() WITHIN GROUP (ORDER BY NULLIF(m.name, '')) AS name,
+                   BOOL_OR(m.is_internal)         AS is_ion,
+                   COUNT(DISTINCT m.thread_id)    AS thread_count,
+                   SUM(m.message_count)           AS messages_sent,
+                   MIN(et.first_message_at)::date AS first_thread_at,
+                   MAX(et.last_message_at)::date  AS last_thread_at,
+                   COUNT(*) OVER ()               AS total_matches
+              FROM m JOIN dealcloud.email_thread et ON et.id = m.thread_id
+             GROUP BY m.email
+             ORDER BY thread_count DESC, last_thread_at DESC
+             LIMIT %s
+            """,
+            [*params, inp.limit],
+        )
+        people = [dict(r) for r in cur.fetchall()]
+        emails = [p["email"] for p in people]
+
+        ion_by: dict[str, list] = {}
+        orgs_by: dict[str, list] = {}
+        if emails:
+            cur.execute(
+                """
+                SELECT LOWER(c.email) AS contact,
+                       LOWER(i.email) AS ion_email,
+                       MAX(NULLIF(i.name, '')) AS ion_name,
+                       COUNT(DISTINCT i.thread_id) AS shared_threads,
+                       MAX(et.last_message_at)::date AS last_shared_at
+                  FROM dealcloud.email_thread_participant c
+                  JOIN dealcloud.email_thread_participant i
+                    ON i.thread_id = c.thread_id AND i.is_internal
+                   AND LOWER(i.email) <> LOWER(c.email)
+                  JOIN dealcloud.email_thread et ON et.id = c.thread_id
+                 WHERE LOWER(c.email) = ANY(%s)
+                 GROUP BY 1, 2
+                 ORDER BY 1, shared_threads DESC, last_shared_at DESC
+                """,
+                (emails,),
+            )
+            for r in cur.fetchall():
+                lst = ion_by.setdefault(r["contact"], [])
+                if len(lst) < _EMAIL_CONTACT_ION_CAP:
+                    lst.append({
+                        "name": r["ion_name"], "email": r["ion_email"],
+                        "shared_threads": r["shared_threads"],
+                        "last_shared_at": r["last_shared_at"],
+                    })
+            cur.execute(
+                """
+                SELECT LOWER(a.email) AS contact, o.id AS org_id, o.name,
+                       a.job_title, a.derived_connection_strength,
+                       a.is_deal_cloud_contact,
+                       EXISTS (SELECT 1 FROM dealcloud.domain_organization d
+                                WHERE d.organization_id = a.organization_id
+                                  AND d.domain = SPLIT_PART(LOWER(a.email), '@', 2)
+                              ) AS domain_match
+                  FROM dealcloud.email_organization_agg a
+                  JOIN dealcloud.organization o ON o.id = a.organization_id
+                 WHERE LOWER(a.email) = ANY(%s)
+                 ORDER BY 1, domain_match DESC, a.email_thread_count DESC,
+                          a.communication_count DESC
+                """,
+                (emails,),
+            )
+            for r in cur.fetchall():
+                lst = orgs_by.setdefault(r["contact"], [])
+                if len(lst) < _EMAIL_CONTACT_ORG_CAP:
+                    lst.append({
+                        "org_id": r["org_id"], "name": r["name"],
+                        "job_title": r["job_title"],
+                        "connection_strength": r["derived_connection_strength"],
+                        "in_dealcloud": r["is_deal_cloud_contact"],
+                        "domain_match": r["domain_match"],
+                    })
+        coverage = _email_coverage(cur)
+
+    total = people[0]["total_matches"] if people else 0
+    for p in people:
+        p.pop("total_matches")
+        p["ion_counterparts"] = [] if p["is_ion"] else ion_by.get(p["email"], [])
+        p["orgs"] = orgs_by.get(p["email"], [])
+    return ToolResult(output={
+        "query": inp.query,
+        "total_matches": total,
+        "results": people,
+        "note": _email_note(coverage),
+    })
+
 
 def _call_dossier_fn(fn_name: str, org_ids: list[int]) -> ToolResult:
     """Invoke one of the dealcloud.org_* functions, returning the JSONB
