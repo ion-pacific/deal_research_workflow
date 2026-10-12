@@ -90,6 +90,16 @@ breakdown, activity by quarter
 - `get_org_dossier(org_id)` -- single-org rich snapshot: identity, \
 counts, main contacts, recent docs / threads / events / slack groups, \
 deal stats. Best for "what's this org" or "what's the most recent thing"
+- `search_email_threads(query?, org_ids?, participant?, ion_person?, \
+categories?, since?, until?)` -- search our indexed deal-related EMAIL \
+threads (LLM summaries, no bodies) by keyword, org, external \
+correspondent (name / address / domain), Ion person or date. Use for \
+"what did we discuss with X", "when did we last email them about Y".
+- `read_email_thread(thread_id)` -- one thread's full summary, \
+participants, orgs and message timeline.
+- `find_email_contacts(query)` -- look up PEOPLE we've emailed by name, \
+address or domain: thread counts, first/last contact, which Ion people \
+they dealt with, their orgs.
 - `read_document_summary(document_id)` -- LLM summary of one document. \
 Use after get_org_dossier or search_documents surfaces a relevant doc id.
 - `search_documents(query, org_ids, limit=10)` -- find docs BY TOPIC \
