@@ -14,6 +14,7 @@ Reuses (don't reinvent):
 """
 from __future__ import annotations
 
+import html
 import re
 from datetime import date
 from typing import Any, Literal
@@ -2517,23 +2518,61 @@ def find_email_contacts(inp: FindEmailContactsInput, ctx: dict) -> ToolResult:
 # other touchpoints Ion staff logged by hand, with their free-text Notes.
 # dce's sync.py::sync_communications already lands them in
 # dealcloud.communication (dc_entity_type='interaction'); these two tools are
-# the first to expose the Notes text rather than just counts. DealCloud-
-# logged EMAILS share that table (dc_entity_type='email', full HTML bodies)
-# and are deliberately left out -- the email tools above only ever expose
-# summaries, and an email body is a different privacy call.
+# the first to expose the Notes text rather than just counts. Emails saved
+# to DealCloud (entity 5340, dc_entity_type='email') share that table with
+# their full Outlook-HTML body in `notes`, and are included: anything filed
+# in DealCloud is already visible firm-wide, unlike the mailbox index the
+# email tools above read (summaries only).
 # ---------------------------------------------------------------------------
 
 _ACTIVITY_PREVIEW_CHARS = 600
 _ACTIVITY_SEARCH_PEOPLE_CAP = 6
 _ACTIVITY_SEARCH_ORG_CAP = 6
 _ACTIVITY_READ_NOTES_CAP = 60_000
+# Raw chars fetched per search row before HTML->text; an email body's first
+# 600 chars of HTML can be all markup, so the preview needs more than that.
+_ACTIVITY_SEARCH_FETCH_CHARS = 20_000
+_ACTIVITY_KINDS = {"activity": "interaction", "email": "email"}
+
+# A tag name must end at whitespace, '/' or '>': DealCloud email bodies carry
+# raw "Jane Doe <jane@x.com>" headers that a looser pattern would delete.
+_HTML_TAG_RE = re.compile(r"</?[a-zA-Z][a-zA-Z0-9:-]*(?=[\s/>])[^<>]*>|<![^<>]*>")
+_HTML_DROP_RE = re.compile(r"<(style|script|head)\b.*?</\1\s*>|<!--.*?-->",
+                           re.I | re.S)
+_HTML_BREAK_RE = re.compile(r"<br\s*/?>|</(p|div|tr|li|h[1-6]|table|blockquote)\s*>",
+                            re.I)
+
+
+def _notes_text(raw: str | None) -> str:
+    """Notes as plain text. Interaction notes are already text/markdown and
+    pass through; DealCloud email bodies are Outlook HTML."""
+    s = (raw or "").strip()
+    if not _HTML_TAG_RE.search(s):
+        return s
+    s = _HTML_DROP_RE.sub("", s)
+    s = re.sub(r"\s+", " ", s)  # source line wraps are not breaks in HTML
+    s = _HTML_BREAK_RE.sub("\n", s)
+    s = re.sub(r"<li\b[^>]*>", "- ", s, flags=re.I)
+    s = _HTML_TAG_RE.sub("", s)
+    s = html.unescape(s).replace("\xa0", " ")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r" *\n *", "\n", s)
+    return re.sub(r"\n{3,}", "\n\n", s).strip()
 
 
 class SearchActivitiesInput(BaseModel):
+    kinds: list[Literal["activity", "email"]] = Field(
+        default_factory=list,
+        description=(
+            "'activity' = calls/meetings/other logged touchpoints with their "
+            "Notes; 'email' = emails filed to DealCloud, with the full body. "
+            "Empty = both."
+        ),
+    )
     query: str | None = Field(
         None, max_length=300,
         description=(
-            "Keywords matched against the activity's subject AND notes. Every "
+            "Keywords matched against the subject AND notes / email body. Every "
             "word must match (case-insensitive substring); wrap a phrase in "
             "double quotes to keep it together, e.g. 'continuation \"term sheet\"'."
         ),
@@ -2627,47 +2666,58 @@ def _activity_people(cur, ids: list[int]) -> tuple[dict, dict]:
 def _activity_coverage(cur) -> dict:
     cur.execute(
         """
-        SELECT COUNT(*) FILTER (WHERE LENGTH(TRIM(notes)) > 0) AS with_notes,
+        SELECT dc_entity_type AS kind,
+               COUNT(*) FILTER (WHERE OCTET_LENGTH(notes) > 0) AS with_notes,
                COUNT(*) AS total,
-               (MIN(date) FILTER (WHERE LENGTH(TRIM(notes)) > 0))::date AS earliest,
-               (MAX(date) FILTER (WHERE LENGTH(TRIM(notes)) > 0))::date AS latest,
+               (MIN(date) FILTER (WHERE OCTET_LENGTH(notes) > 0))::date AS earliest,
+               (MAX(date) FILTER (WHERE OCTET_LENGTH(notes) > 0))::date AS latest,
                MAX(last_synced_at)::date AS synced
           FROM dealcloud.communication
-         WHERE dc_entity_type = 'interaction'
+         WHERE dc_entity_type IN ('interaction', 'email')
+         GROUP BY dc_entity_type
         """
     )
-    return dict(cur.fetchone())
+    return {r["kind"]: dict(r) for r in cur.fetchall()}
 
 
 def _activity_note(cov: dict) -> str:
     # In the RESPONSE, not the description: the numbers move every sync.
+    a = cov.get("interaction") or {}
+    e = cov.get("email") or {}
     return (
-        f"DealCloud holds {cov['total']} logged activities, {cov['with_notes']} "
-        f"with Notes ({cov['earliest']} to {cov['latest']}; last synced "
-        f"{cov['synced']}). Notes are whatever the Ion person typed or pasted "
-        "-- treat them as one attendee's account, not a transcript. Not every "
-        "call or meeting gets logged, so 'nothing found' is not proof there "
-        "was no contact; check search_email_threads and "
-        "get_org_communication_timeline too."
+        f"DealCloud holds {a.get('total', 0)} logged activities, "
+        f"{a.get('with_notes', 0)} with Notes ({a.get('earliest')} to "
+        f"{a.get('latest')}), and {e.get('total', 0)} filed emails "
+        f"({e.get('earliest')} to {e.get('latest')}); last synced "
+        f"{a.get('synced') or e.get('synced')}. Activity notes are whatever "
+        "the Ion person typed or pasted -- one attendee's account, not a "
+        "transcript. Only emails someone chose to file are here; "
+        "search_email_threads covers the wider mailbox index. Not every "
+        "call, meeting or email gets logged, so 'nothing found' is not "
+        "proof there was no contact."
     )
 
 
 @slack_registry.tool(
     "search_dealcloud_activities",
     (
-        "Search the Activities Ion staff logged in DealCloud -- calls, "
-        "meetings and other touchpoints -- INCLUDING their free-text Notes "
-        "(call notes, meeting write-ups, diligence takeaways). Use for 'what "
+        "Search what Ion staff logged in DealCloud: Activities (calls, "
+        "meetings, other touchpoints) INCLUDING their free-text Notes (call "
+        "notes, meeting write-ups, diligence takeaways), and emails filed to "
+        "DealCloud with their FULL body text. Use for 'what "
         "did we hear on the last call with X', 'what notes do we have on "
         "Y', 'who at Ion met Z and what was said', 'which calls discussed a "
-        "continuation vehicle'. Combine any of: keywords (matched in subject "
-        "+ notes), org_ids, deal_ids, an Ion attendee, an external contact, "
-        "activity types and a date range; at least one filter is required. "
+        "continuation vehicle', 'what did they write when they sent the "
+        "deck'. Combine any of: kinds (activity / email), keywords (matched "
+        "in subject + notes/body), org_ids, deal_ids, an Ion attendee or "
+        "recipient, an external contact, types and a date range; at least "
+        "one filter besides kinds is required. "
         "Newest first, with `total_matches` for paging. Each row has "
-        "activity_id, subject, type, date, attendees, linked orgs/deals and "
-        "a notes preview; call read_dealcloud_activity for the full notes. "
-        "Does not cover DealCloud-logged emails (use search_email_threads) "
-        "or SharePoint documents (use search_documents). Read-only."
+        "activity_id, kind, subject, type, date, attendees, linked "
+        "orgs/deals and a notes/body preview; call read_dealcloud_activity "
+        "for the full text. For the wider (summary-only) mailbox index use "
+        "search_email_threads; for SharePoint files, search_documents. "
+        "Read-only."
     ),
     SearchActivitiesInput,
 )
@@ -2680,12 +2730,14 @@ def search_dealcloud_activities(inp: SearchActivitiesInput, ctx: dict) -> ToolRe
             "contact, types, since or until."
         ))
 
-    where, params = ["c.dc_entity_type = 'interaction'"], []
+    where = ["c.dc_entity_type = ANY(%s)"]
+    params: list[Any] = [[_ACTIVITY_KINDS[k] for k in (inp.kinds or _ACTIVITY_KINDS)]]
     if inp.with_notes_only:
-        where.append("LENGTH(TRIM(c.notes)) > 0")
+        where.append("OCTET_LENGTH(c.notes) > 0")
+    # Not subject || notes: concatenating copies every (TOASTed) email body.
     for t in terms:
-        where.append("(COALESCE(c.subject, '') || ' ' || COALESCE(c.notes, '')) ILIKE %s")
-        params.append(_like(t))
+        where.append("(c.subject ILIKE %s OR c.notes ILIKE %s)")
+        params += [_like(t), _like(t)]
     if inp.org_ids:
         where.append(
             "EXISTS (SELECT 1 FROM dealcloud.organization_entity oe "
@@ -2734,16 +2786,17 @@ def search_dealcloud_activities(inp: SearchActivitiesInput, ctx: dict) -> ToolRe
             f"""
             SELECT c.id AS activity_id, c.subject,
                    COALESCE(c.communication_type, 'Unspecified') AS type,
-                   c.date::date AS date,
-                   LEFT(COALESCE(c.notes, ''), %s) AS notes_preview,
-                   LENGTH(COALESCE(c.notes, '')) AS notes_chars,
+                   c.dc_entity_type, c.date::date AS date,
+                   LEFT(COALESCE(c.notes, ''), %s) AS notes_head,
+                   LENGTH(COALESCE(c.notes, '')) > %s AS notes_cut,
                    COUNT(*) OVER () AS total_matches
               FROM dealcloud.communication c
              WHERE {' AND '.join(where)}
              ORDER BY c.date DESC NULLS LAST, c.id DESC
              LIMIT %s OFFSET %s
             """,
-            [_ACTIVITY_PREVIEW_CHARS, *params, inp.limit, inp.offset],
+            [_ACTIVITY_SEARCH_FETCH_CHARS, _ACTIVITY_SEARCH_FETCH_CHARS,
+             *params, inp.limit, inp.offset],
         )
         rows = [dict(r) for r in cur.fetchall()]
         total = rows[0]["total_matches"] if rows else 0
@@ -2784,9 +2837,11 @@ def search_dealcloud_activities(inp: SearchActivitiesInput, ctx: dict) -> ToolRe
     results = []
     for r in rows:
         aid = r["activity_id"]
-        truncated = r["notes_chars"] > _ACTIVITY_PREVIEW_CHARS
+        text = _notes_text(r["notes_head"])
+        truncated = r["notes_cut"] or len(text) > _ACTIVITY_PREVIEW_CHARS
         results.append({
             "activity_id":   aid,
+            "kind":          "email" if r["dc_entity_type"] == "email" else "activity",
             "subject":       r["subject"],
             "type":          r["type"],
             "date":          r["date"],
@@ -2794,9 +2849,8 @@ def search_dealcloud_activities(inp: SearchActivitiesInput, ctx: dict) -> ToolRe
             "external_attendees": ext.get(aid, [])[:_ACTIVITY_SEARCH_PEOPLE_CAP],
             "orgs":          orgs.get(aid, []),
             "deals":         deals.get(aid, []),
-            "notes_preview": (r["notes_preview"] + ("..." if truncated else ""))
-                             or "(no notes)",
-            "notes_chars":   r["notes_chars"],
+            "notes_preview": (text[:_ACTIVITY_PREVIEW_CHARS]
+                              + ("..." if truncated else "")) or "(no notes)",
         })
     return ToolResult(output={
         "total_matches": total,
@@ -2811,7 +2865,8 @@ def search_dealcloud_activities(inp: SearchActivitiesInput, ctx: dict) -> ToolRe
     "read_dealcloud_activity",
     (
         "Open ONE DealCloud Activity (call / meeting / other logged "
-        "touchpoint): its complete Notes text, type, date, every Ion and "
+        "touchpoint) or filed email: its complete Notes / email body as "
+        "text, type, date, every Ion and "
         "external attendee, and the orgs and deals it is linked to. Use "
         "after search_dealcloud_activities surfaces a relevant activity_id. "
         "The notes are one attendee's own write-up -- attribute claims to "
@@ -2824,11 +2879,11 @@ def read_dealcloud_activity(inp: ActivityIdInput, ctx: dict) -> ToolResult:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(
             """
-            SELECT id AS activity_id, dc_id, subject,
+            SELECT id AS activity_id, dc_id, dc_entity_type, subject,
                    COALESCE(communication_type, 'Unspecified') AS type,
                    date, notes, last_synced_at
               FROM dealcloud.communication
-             WHERE id = %s AND dc_entity_type = 'interaction'
+             WHERE id = %s AND dc_entity_type IN ('interaction', 'email')
             """,
             (inp.activity_id,),
         )
@@ -2859,10 +2914,11 @@ def read_dealcloud_activity(inp: ActivityIdInput, ctx: dict) -> ToolResult:
         )
         linked_deals = [dict(r) for r in cur.fetchall()]
 
-    notes = (a["notes"] or "").strip()
+    notes = _notes_text(a["notes"])
     truncated = len(notes) > _ACTIVITY_READ_NOTES_CAP
     return ToolResult(output={
         "activity_id":   a["activity_id"],
+        "kind":          "email" if a["dc_entity_type"] == "email" else "activity",
         "dealcloud_entry_id": a["dc_id"],
         "subject":       a["subject"],
         "type":          a["type"],
