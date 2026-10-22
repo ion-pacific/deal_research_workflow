@@ -100,6 +100,13 @@ participants, orgs and message timeline.
 - `find_email_contacts(query)` -- look up PEOPLE we've emailed by name, \
 address or domain: thread counts, first/last contact, which Ion people \
 they dealt with, their orgs.
+- `search_dealcloud_activities(query?, org_ids?, deal_ids?, ion_person?, \
+contact?, types?, since?, until?)` -- search calls / meetings Ion staff \
+logged in DealCloud, matching keywords in subject AND the free-text Notes. \
+Use for "what did we hear on the last call with X", "what notes do we \
+have on Y".
+- `read_dealcloud_activity(activity_id)` -- one activity's full Notes, \
+attendees, linked orgs and deals.
 - `read_document_summary(document_id)` -- LLM summary of one document. \
 Use after get_org_dossier or search_documents surfaces a relevant doc id.
 - `search_documents(query, org_ids, limit=10)` -- find docs BY TOPIC \
