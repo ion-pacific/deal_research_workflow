@@ -281,7 +281,8 @@ def get_org_their_contacts(inp: OrgIdsInput, ctx: dict) -> ToolResult:
         "Q5: When have we engaged this org? Returns first/last touch, "
         "duration, total touches, per-channel breakdown (email / slack / "
         "calendar / DC communications / documents), and activity by "
-        "quarter."
+        "quarter. Counts and dates only -- for what was said on logged "
+        "calls/meetings use search_dealcloud_activities."
     ),
     OrgIdsInput,
 )
@@ -2042,7 +2043,8 @@ def _email_note(coverage: dict) -> str:
         "summary is stored -- never the email body. So 'no thread found' "
         "means no deal-related thread was indexed in that window, not proof "
         "that nobody ever emailed them; older contact may still show up in "
-        "get_org_communication_timeline (DealCloud activities, calendar)."
+        "get_org_communication_timeline (DealCloud activities, calendar), "
+        "and logged call/meeting notes in search_dealcloud_activities."
     )
 
 
@@ -2507,6 +2509,371 @@ def find_email_contacts(inp: FindEmailContactsInput, ctx: dict) -> ToolResult:
         "total_matches": total,
         "results": people,
         "note": _email_note(coverage),
+    })
+
+
+# ---------------------------------------------------------------------------
+# DealCloud Activities (the Interaction entity, 5341): calls, meetings and
+# other touchpoints Ion staff logged by hand, with their free-text Notes.
+# dce's sync.py::sync_communications already lands them in
+# dealcloud.communication (dc_entity_type='interaction'); these two tools are
+# the first to expose the Notes text rather than just counts. DealCloud-
+# logged EMAILS share that table (dc_entity_type='email', full HTML bodies)
+# and are deliberately left out -- the email tools above only ever expose
+# summaries, and an email body is a different privacy call.
+# ---------------------------------------------------------------------------
+
+_ACTIVITY_PREVIEW_CHARS = 600
+_ACTIVITY_SEARCH_PEOPLE_CAP = 6
+_ACTIVITY_SEARCH_ORG_CAP = 6
+_ACTIVITY_READ_NOTES_CAP = 60_000
+
+
+class SearchActivitiesInput(BaseModel):
+    query: str | None = Field(
+        None, max_length=300,
+        description=(
+            "Keywords matched against the activity's subject AND notes. Every "
+            "word must match (case-insensitive substring); wrap a phrase in "
+            "double quotes to keep it together, e.g. 'continuation \"term sheet\"'."
+        ),
+    )
+    org_ids: list[int] = Field(
+        default_factory=list, max_length=20,
+        description=(
+            "Restrict to activities linked to these orgs. Pass canonical "
+            "heads from find_organizations / bundle_via_supersede."
+        ),
+    )
+    deal_ids: list[int] = Field(
+        default_factory=list, max_length=20,
+        description=(
+            "Restrict to activities linked to these dealcloud.deal ids. Few "
+            "activities carry a deal link in DealCloud, so prefer org_ids "
+            "(the deal's counterparty / underlying company) unless this "
+            "returns results."
+        ),
+    )
+    ion_person: str | None = Field(
+        None, max_length=200,
+        description="An Ion Pacific attendee: a name or @ionpacific.com address. Substring match.",
+    )
+    contact: str | None = Field(
+        None, max_length=200,
+        description="An EXTERNAL attendee (DealCloud contact): a name or email address. Substring match.",
+    )
+    types: list[str] = Field(
+        default_factory=list, max_length=10,
+        description="Restrict to these activity types, e.g. ['Call', 'Meeting']. Empty = all.",
+    )
+    with_notes_only: bool = Field(
+        True,
+        description=(
+            "Default true: only activities that have Notes text. Set false to "
+            "also list bare log entries (subject/date/attendees, no notes)."
+        ),
+    )
+    since: date | None = Field(None, description="Only activities on or after this date (YYYY-MM-DD).")
+    until: date | None = Field(None, description="Only activities on or before this date (YYYY-MM-DD).")
+    limit: int = Field(15, ge=1, le=50, description="Max activities to return.")
+    offset: int = Field(0, ge=0, description="For paging through `total_matches`.")
+
+
+class ActivityIdInput(BaseModel):
+    activity_id: int = Field(
+        ..., description="activity_id from search_dealcloud_activities (dealcloud.communication.id).",
+    )
+
+
+def _activity_people(cur, ids: list[int]) -> tuple[dict, dict]:
+    """(ion attendees, external contacts) per activity id, as display strings."""
+    ion: dict[int, list[str]] = {}
+    ext: dict[int, list[str]] = {}
+    if not ids:
+        return ion, ext
+    cur.execute(
+        """
+        SELECT communication_id, employee_email, employee_name
+          FROM dealcloud.communication_employee
+         WHERE communication_id = ANY(%s)
+         ORDER BY communication_id, employee_name, employee_email
+        """,
+        (ids,),
+    )
+    for r in cur.fetchall():
+        ion.setdefault(r["communication_id"], []).append(
+            r["employee_name"] or r["employee_email"])
+    cur.execute(
+        """
+        SELECT cc.communication_id,
+               NULLIF(TRIM(CONCAT_WS(' ', ct.first_name, ct.last_name)), '') AS name,
+               ct.email, o.name AS org_name
+          FROM dealcloud.communication_contact cc
+          JOIN dealcloud.contact ct ON ct.id = cc.contact_id
+          LEFT JOIN dealcloud.organization o ON o.id = ct.organization_id
+         WHERE cc.communication_id = ANY(%s)
+         ORDER BY cc.communication_id, ct.last_name, ct.first_name
+        """,
+        (ids,),
+    )
+    for r in cur.fetchall():
+        label = r["name"] or r["email"] or "(unnamed contact)"
+        if r["org_name"]:
+            label = f"{label} ({r['org_name']})"
+        ext.setdefault(r["communication_id"], []).append(label)
+    return ion, ext
+
+
+def _activity_coverage(cur) -> dict:
+    cur.execute(
+        """
+        SELECT COUNT(*) FILTER (WHERE LENGTH(TRIM(notes)) > 0) AS with_notes,
+               COUNT(*) AS total,
+               (MIN(date) FILTER (WHERE LENGTH(TRIM(notes)) > 0))::date AS earliest,
+               (MAX(date) FILTER (WHERE LENGTH(TRIM(notes)) > 0))::date AS latest,
+               MAX(last_synced_at)::date AS synced
+          FROM dealcloud.communication
+         WHERE dc_entity_type = 'interaction'
+        """
+    )
+    return dict(cur.fetchone())
+
+
+def _activity_note(cov: dict) -> str:
+    # In the RESPONSE, not the description: the numbers move every sync.
+    return (
+        f"DealCloud holds {cov['total']} logged activities, {cov['with_notes']} "
+        f"with Notes ({cov['earliest']} to {cov['latest']}; last synced "
+        f"{cov['synced']}). Notes are whatever the Ion person typed or pasted "
+        "-- treat them as one attendee's account, not a transcript. Not every "
+        "call or meeting gets logged, so 'nothing found' is not proof there "
+        "was no contact; check search_email_threads and "
+        "get_org_communication_timeline too."
+    )
+
+
+@slack_registry.tool(
+    "search_dealcloud_activities",
+    (
+        "Search the Activities Ion staff logged in DealCloud -- calls, "
+        "meetings and other touchpoints -- INCLUDING their free-text Notes "
+        "(call notes, meeting write-ups, diligence takeaways). Use for 'what "
+        "did we hear on the last call with X', 'what notes do we have on "
+        "Y', 'who at Ion met Z and what was said', 'which calls discussed a "
+        "continuation vehicle'. Combine any of: keywords (matched in subject "
+        "+ notes), org_ids, deal_ids, an Ion attendee, an external contact, "
+        "activity types and a date range; at least one filter is required. "
+        "Newest first, with `total_matches` for paging. Each row has "
+        "activity_id, subject, type, date, attendees, linked orgs/deals and "
+        "a notes preview; call read_dealcloud_activity for the full notes. "
+        "Does not cover DealCloud-logged emails (use search_email_threads) "
+        "or SharePoint documents (use search_documents). Read-only."
+    ),
+    SearchActivitiesInput,
+)
+def search_dealcloud_activities(inp: SearchActivitiesInput, ctx: dict) -> ToolResult:
+    terms = _split_terms(inp.query)
+    if not (terms or inp.org_ids or inp.deal_ids or inp.ion_person
+            or inp.contact or inp.types or inp.since or inp.until):
+        return ToolResult(output=(
+            "Give at least one filter: query, org_ids, deal_ids, ion_person, "
+            "contact, types, since or until."
+        ))
+
+    where, params = ["c.dc_entity_type = 'interaction'"], []
+    if inp.with_notes_only:
+        where.append("LENGTH(TRIM(c.notes)) > 0")
+    for t in terms:
+        where.append("(COALESCE(c.subject, '') || ' ' || COALESCE(c.notes, '')) ILIKE %s")
+        params.append(_like(t))
+    if inp.org_ids:
+        where.append(
+            "EXISTS (SELECT 1 FROM dealcloud.organization_entity oe "
+            "         WHERE oe.entity_type = 'communication' "
+            "           AND oe.entity_id = c.id "
+            "           AND oe.organization_id = ANY(%s))"
+        )
+        params.append(inp.org_ids)
+    if inp.deal_ids:
+        where.append(
+            "EXISTS (SELECT 1 FROM dealcloud.communication_deal cd "
+            "         WHERE cd.communication_id = c.id AND cd.deal_id = ANY(%s))"
+        )
+        params.append(inp.deal_ids)
+    if inp.ion_person and inp.ion_person.strip():
+        pat = _like(inp.ion_person.strip())
+        where.append(
+            "EXISTS (SELECT 1 FROM dealcloud.communication_employee ce "
+            "         WHERE ce.communication_id = c.id "
+            "           AND (ce.employee_email ILIKE %s OR ce.employee_name ILIKE %s))"
+        )
+        params += [pat, pat]
+    if inp.contact and inp.contact.strip():
+        pat = _like(inp.contact.strip())
+        where.append(
+            "EXISTS (SELECT 1 FROM dealcloud.communication_contact cc "
+            "          JOIN dealcloud.contact ct ON ct.id = cc.contact_id "
+            "         WHERE cc.communication_id = c.id "
+            "           AND (ct.email ILIKE %s "
+            "                OR CONCAT_WS(' ', ct.first_name, ct.last_name) ILIKE %s))"
+        )
+        params += [pat, pat]
+    if inp.types:
+        where.append("LOWER(c.communication_type) = ANY(%s)")
+        params.append([t.lower() for t in inp.types])
+    if inp.since:
+        where.append("c.date >= %s")
+        params.append(inp.since)
+    if inp.until:
+        where.append("c.date < %s::date + 1")
+        params.append(inp.until)
+
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            f"""
+            SELECT c.id AS activity_id, c.subject,
+                   COALESCE(c.communication_type, 'Unspecified') AS type,
+                   c.date::date AS date,
+                   LEFT(COALESCE(c.notes, ''), %s) AS notes_preview,
+                   LENGTH(COALESCE(c.notes, '')) AS notes_chars,
+                   COUNT(*) OVER () AS total_matches
+              FROM dealcloud.communication c
+             WHERE {' AND '.join(where)}
+             ORDER BY c.date DESC NULLS LAST, c.id DESC
+             LIMIT %s OFFSET %s
+            """,
+            [_ACTIVITY_PREVIEW_CHARS, *params, inp.limit, inp.offset],
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        total = rows[0]["total_matches"] if rows else 0
+        ids = [r["activity_id"] for r in rows]
+
+        ion, ext = _activity_people(cur, ids)
+        orgs: dict[int, list] = {}
+        deals: dict[int, list] = {}
+        if ids:
+            cur.execute(
+                """
+                SELECT DISTINCT oe.entity_id AS activity_id, o.id AS org_id, o.name
+                  FROM dealcloud.organization_entity oe
+                  JOIN dealcloud.organization o ON o.id = oe.organization_id
+                 WHERE oe.entity_type = 'communication' AND oe.entity_id = ANY(%s)
+                 ORDER BY 1, 2
+                """,
+                (ids,),
+            )
+            for o in cur.fetchall():
+                lst = orgs.setdefault(o["activity_id"], [])
+                if len(lst) < _ACTIVITY_SEARCH_ORG_CAP:
+                    lst.append({"org_id": o["org_id"], "name": o["name"]})
+            cur.execute(
+                """
+                SELECT cd.communication_id AS activity_id, d.id AS deal_id, d.name
+                  FROM dealcloud.communication_deal cd
+                  JOIN dealcloud.deal d ON d.id = cd.deal_id
+                 WHERE cd.communication_id = ANY(%s)
+                """,
+                (ids,),
+            )
+            for d in cur.fetchall():
+                deals.setdefault(d["activity_id"], []).append(
+                    {"deal_id": d["deal_id"], "name": d["name"]})
+        coverage = _activity_coverage(cur)
+
+    results = []
+    for r in rows:
+        aid = r["activity_id"]
+        truncated = r["notes_chars"] > _ACTIVITY_PREVIEW_CHARS
+        results.append({
+            "activity_id":   aid,
+            "subject":       r["subject"],
+            "type":          r["type"],
+            "date":          r["date"],
+            "ion_attendees": ion.get(aid, [])[:_ACTIVITY_SEARCH_PEOPLE_CAP],
+            "external_attendees": ext.get(aid, [])[:_ACTIVITY_SEARCH_PEOPLE_CAP],
+            "orgs":          orgs.get(aid, []),
+            "deals":         deals.get(aid, []),
+            "notes_preview": (r["notes_preview"] + ("..." if truncated else ""))
+                             or "(no notes)",
+            "notes_chars":   r["notes_chars"],
+        })
+    return ToolResult(output={
+        "total_matches": total,
+        "returned": len(results),
+        "offset": inp.offset,
+        "results": results,
+        "note": _activity_note(coverage),
+    })
+
+
+@slack_registry.tool(
+    "read_dealcloud_activity",
+    (
+        "Open ONE DealCloud Activity (call / meeting / other logged "
+        "touchpoint): its complete Notes text, type, date, every Ion and "
+        "external attendee, and the orgs and deals it is linked to. Use "
+        "after search_dealcloud_activities surfaces a relevant activity_id. "
+        "The notes are one attendee's own write-up -- attribute claims to "
+        "them rather than stating them as fact. Read-only."
+    ),
+    ActivityIdInput,
+)
+def read_dealcloud_activity(inp: ActivityIdInput, ctx: dict) -> ToolResult:
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            """
+            SELECT id AS activity_id, dc_id, subject,
+                   COALESCE(communication_type, 'Unspecified') AS type,
+                   date, notes, last_synced_at
+              FROM dealcloud.communication
+             WHERE id = %s AND dc_entity_type = 'interaction'
+            """,
+            (inp.activity_id,),
+        )
+        a = cur.fetchone()
+        if a is None:
+            return ToolResult(output=f"DealCloud activity {inp.activity_id} not found.")
+        a = dict(a)
+        ion, ext = _activity_people(cur, [inp.activity_id])
+        cur.execute(
+            """
+            SELECT DISTINCT o.id AS org_id, o.name
+              FROM dealcloud.organization_entity oe
+              JOIN dealcloud.organization o ON o.id = oe.organization_id
+             WHERE oe.entity_type = 'communication' AND oe.entity_id = %s
+             ORDER BY o.id
+            """,
+            (inp.activity_id,),
+        )
+        linked_orgs = [dict(r) for r in cur.fetchall()]
+        cur.execute(
+            """
+            SELECT d.id AS deal_id, d.name, d.status
+              FROM dealcloud.communication_deal cd
+              JOIN dealcloud.deal d ON d.id = cd.deal_id
+             WHERE cd.communication_id = %s
+            """,
+            (inp.activity_id,),
+        )
+        linked_deals = [dict(r) for r in cur.fetchall()]
+
+    notes = (a["notes"] or "").strip()
+    truncated = len(notes) > _ACTIVITY_READ_NOTES_CAP
+    return ToolResult(output={
+        "activity_id":   a["activity_id"],
+        "dealcloud_entry_id": a["dc_id"],
+        "subject":       a["subject"],
+        "type":          a["type"],
+        "date":          a["date"],
+        "ion_attendees": ion.get(inp.activity_id, []),
+        "external_attendees": ext.get(inp.activity_id, []),
+        "orgs":          linked_orgs,
+        "deals":         linked_deals,
+        "notes":         (notes[:_ACTIVITY_READ_NOTES_CAP] or "(no notes logged)"),
+        "notes_truncated": truncated,
+        "last_synced_at": a["last_synced_at"],
     })
 
 
