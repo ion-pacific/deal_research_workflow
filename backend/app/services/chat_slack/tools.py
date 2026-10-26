@@ -2933,6 +2933,451 @@ def read_dealcloud_activity(inp: ActivityIdInput, ctx: dict) -> ToolResult:
     })
 
 
+# ---------------------------------------------------------------------------
+# Slack conversations: Ion's own public channels as indexed by dce's
+# slack_indexer (daily `slack-daily-sync`). A "group" is one thread, or a
+# 30-minute window of top-level messages, stored with its verbatim text
+# (`raw_text`, "[YYYY-MM-DD HH:MM] Name: text" lines), an LLM summary, and
+# LLM-attributed orgs/deals. Until these two tools Slack reached the model
+# only as get_org_dossier's 3 most recent groups (200-char summaries) -- and
+# not at all for the ~half of groups with no org link. The text is verbatim
+# by design: every Ion member can already read these channels in Slack.
+# ---------------------------------------------------------------------------
+
+_SLACK_PREVIEW_CHARS = 400
+_SLACK_SNIPPET_BEFORE = 150
+_SLACK_SNIPPET_LEN = 400
+_SLACK_SEARCH_PEOPLE_CAP = 8
+_SLACK_SEARCH_ORG_CAP = 6
+_SLACK_READ_TEXT_CAP = 30_000
+_SLACK_READ_FILE_CAP = 20
+_SLACK_MENTION_LOOKUP_CAP = 15
+# A few legacy rows carry non-numeric ts; every ts->time cast is guarded.
+_SLACK_TS_OK = "smg.last_ts ~ '^[0-9]+(\\.[0-9]+)?$' AND smg.first_ts ~ '^[0-9]+(\\.[0-9]+)?$'"
+
+_SLACK_USER_RE = re.compile(r"<@([UW][A-Z0-9]+)(?:\|([^>]*))?>")
+_SLACK_SPECIAL_RE = re.compile(r"<!(channel|here|everyone)(?:\|[^>]*)?>")
+_SLACK_SUBTEAM_RE = re.compile(r"<!subteam\^[A-Z0-9]+(?:\|([^>]*))?>")
+_SLACK_CHANNEL_RE = re.compile(r"<#[A-Z0-9]+\|([^>]*)>")
+_SLACK_LINK_RE = re.compile(r"<((?:https?|mailto):[^|>]+)(?:\|([^>]*))?>")
+
+
+def _slack_text(raw: str | None, resolve_names: bool = False) -> str:
+    """Slack's wire markup -> plain text: `<url|label>` becomes
+    `label (url)`, channel/group mentions their names, and HTML entities
+    unescaped. With resolve_names, `<@U...>` mentions become `@Real Name`
+    via the bot token (a handful of cached users.info calls; unresolved
+    ids are kept as `@U...`)."""
+    if not raw:
+        return ""
+    from ..slack.users import slack_user_display_name  # slack_sdk import is lazy
+
+    names: dict[str, str | None] = {}
+
+    def _user(m: re.Match) -> str:
+        uid, label = m.group(1), m.group(2)
+        if label:
+            return f"@{label}"
+        if resolve_names and uid not in names and len(names) < _SLACK_MENTION_LOOKUP_CAP:
+            names[uid] = slack_user_display_name(uid)
+        return f"@{names.get(uid) or uid}"
+
+    def _link(m: re.Match) -> str:
+        url, label = m.group(1), m.group(2)
+        url = url.removeprefix("mailto:") if label else url
+        return f"{label} ({url})" if label and label != url else url
+
+    text = _SLACK_USER_RE.sub(_user, raw)
+    text = _SLACK_SPECIAL_RE.sub(lambda m: f"@{m.group(1)}", text)
+    text = _SLACK_SUBTEAM_RE.sub(lambda m: m.group(1) or "@group", text)
+    text = _SLACK_CHANNEL_RE.sub(lambda m: f"#{m.group(1)}", text)
+    text = _SLACK_LINK_RE.sub(_link, text)
+    return html.unescape(text)
+
+
+def _slack_summary(summary: str | None) -> str:
+    """dce's scanner stores a failed LLM call as a marker, not NULL."""
+    if not summary or summary in ("[llm_failed]", "[scan_failed]"):
+        return "(no summary -- read the messages)"
+    return summary
+
+
+def _slack_snippet(text: str, terms: list[str]) -> str | None:
+    """~400 chars of the verbatim text around the first term that occurs."""
+    low = text.lower()
+    hits = [i for i in (low.find(t.lower()) for t in terms) if i >= 0]
+    if not hits:
+        return None
+    start = max(0, min(hits) - _SLACK_SNIPPET_BEFORE)
+    end = start + _SLACK_SNIPPET_LEN
+    return ("..." if start else "") + text[start:end] + ("..." if end < len(text) else "")
+
+
+def _slack_coverage(cur) -> dict:
+    cur.execute(
+        f"""
+        SELECT COUNT(*) AS groups,
+               COUNT(DISTINCT smg.channel_id) AS channels,
+               to_timestamp(MIN(smg.first_ts::numeric))::date AS earliest,
+               to_timestamp(MAX(smg.last_ts::numeric))::date  AS latest,
+               MAX(smg.created_at)::date AS last_indexed
+          FROM dealcloud.slack_message_group smg
+         WHERE {_SLACK_TS_OK}
+        """
+    )
+    return dict(cur.fetchone())
+
+
+def _slack_note(cov: dict) -> str:
+    # In the RESPONSE, not the description: the numbers move every daily sync.
+    return (
+        f"Slack index covers {cov['groups']} conversations across "
+        f"{cov['channels']} of Ion's PUBLIC channels, {cov['earliest']} to "
+        f"{cov['latest']} (last indexed {cov['last_indexed']}). Private "
+        "channels and DMs are never indexed, and a few chatter channels "
+        "(all_staff, off-topic, newsletter, office) are skipped. A "
+        "conversation is one thread or a 30-minute burst of channel "
+        "messages, so one discussion can span several. Org and deal links "
+        "are LLM-attributed and only about half of conversations have one: "
+        "if org_ids/deal_ids come back thin, retry with the company's name "
+        "as `query`. 'Nothing found' means nothing in those channels, not "
+        "that it was never discussed. Times are UTC."
+    )
+
+
+class SearchSlackInput(BaseModel):
+    query: str | None = Field(
+        None, max_length=200,
+        description=(
+            "Keywords matched literally (case-insensitive) against the "
+            "conversation's VERBATIM message text and its summary. Every "
+            "word must appear; wrap a phrase in double quotes to match it "
+            "as-is, e.g. '\"capital call\" Prelude'. Not semantic. A company "
+            "name is usually the best query -- it also finds the "
+            "conversations no org was attributed to."
+        ),
+    )
+    org_ids: list[int] = Field(
+        default_factory=list, max_length=20,
+        description=(
+            "Restrict to conversations attributed to these orgs (canonical "
+            "heads from find_organizations / bundle_via_supersede)."
+        ),
+    )
+    deal_ids: list[int] = Field(
+        default_factory=list, max_length=20,
+        description="Restrict to conversations linked to these dealcloud.deal ids.",
+    )
+    channel: str | None = Field(
+        None, max_length=100,
+        description="Channel name, or part of it ('deals', '#fund-ops'). Substring match.",
+    )
+    participant: str | None = Field(
+        None, max_length=100,
+        description=(
+            "Someone who posted in the conversation, by name (Slack real "
+            "names, e.g. 'Lailo'). Substring match."
+        ),
+    )
+    since: date | None = Field(
+        None, description="Only conversations active on or after this date (YYYY-MM-DD)."
+    )
+    until: date | None = Field(
+        None, description="Only conversations that started on or before this date (YYYY-MM-DD)."
+    )
+    limit: int = Field(15, ge=1, le=50, description="Max conversations to return.")
+    offset: int = Field(0, ge=0, description="For paging through `total_matches`.")
+
+
+class SlackConversationIdInput(BaseModel):
+    conversation_id: int = Field(
+        ...,
+        description=(
+            "conversation_id from search_slack_conversations (the `id` of a "
+            "slack group in get_org_dossier; dealcloud.slack_message_group.id)."
+        ),
+    )
+
+
+@slack_registry.tool(
+    "search_slack_conversations",
+    (
+        "Search Ion Pacific's own internal SLACK conversations (public "
+        "channels), matching keywords in the VERBATIM messages as well as "
+        "an LLM summary. Use for 'what has the team said about X on Slack', "
+        "'who flagged Y', 'what's been discussed in #<channel> this month', "
+        "'when did <person> last mention Z'. Combine any of: keywords, "
+        "org_ids, deal_ids, a channel, a participant and a date range; at "
+        "least one filter is required. Newest first, with `total_matches` "
+        "for paging. Each row has conversation_id, channel, first/last "
+        "message time, who posted, a summary preview, a `match_snippet` of "
+        "the actual text around your keyword, the attributed orgs/deals and "
+        "a Slack permalink. Call read_slack_conversation for the full "
+        "message text. CITING: link a conversation as [#channel, date]"
+        "(permalink). Read-only."
+    ),
+    SearchSlackInput,
+)
+def search_slack_conversations(inp: SearchSlackInput, ctx: dict) -> ToolResult:
+    terms = _split_terms(inp.query)
+    channel = (inp.channel or "").strip().lstrip("#")
+    participant = (inp.participant or "").strip()
+    if not (terms or inp.org_ids or inp.deal_ids or channel or participant
+            or inp.since or inp.until):
+        return ToolResult(output=(
+            "Give at least one filter: query, org_ids, deal_ids, channel, "
+            "participant, since or until."
+        ))
+
+    where, params = [_SLACK_TS_OK], []
+    # Not summary || raw_text: no need to build a copy of every row's text.
+    for t in terms:
+        where.append("(smg.raw_text ILIKE %s OR smg.summary ILIKE %s)")
+        params += [_like(t), _like(t)]
+    if inp.org_ids:
+        where.append(
+            "EXISTS (SELECT 1 FROM dealcloud.organization_entity oe "
+            "         WHERE oe.entity_type = 'slack_message_group' "
+            "           AND oe.entity_id = smg.id "
+            "           AND oe.organization_id = ANY(%s))"
+        )
+        params.append(inp.org_ids)
+    if inp.deal_ids:
+        where.append(
+            "EXISTS (SELECT 1 FROM dealcloud.slack_message_group_deal sd "
+            "         WHERE sd.message_group_id = smg.id AND sd.deal_id = ANY(%s))"
+        )
+        params.append(inp.deal_ids)
+    if channel:
+        where.append("sc.name ILIKE %s")
+        params.append(_like(channel))
+    if participant:
+        where.append(
+            "EXISTS (SELECT 1 FROM unnest(smg.participants) p WHERE p ILIKE %s)"
+        )
+        params.append(_like(participant))
+    if inp.since:
+        where.append("to_timestamp(smg.last_ts::numeric) >= %s")
+        params.append(inp.since)
+    if inp.until:
+        where.append("to_timestamp(smg.first_ts::numeric) < %s::date + 1")
+        params.append(inp.until)
+
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            f"""
+            SELECT smg.id AS conversation_id, sc.name AS channel,
+                   sc.is_archived AS channel_archived,
+                   smg.thread_ts IS NOT NULL AS is_thread,
+                   to_timestamp(smg.first_ts::numeric) AS first_message_at,
+                   to_timestamp(smg.last_ts::numeric)  AS last_message_at,
+                   smg.message_count, smg.participants, smg.permalink,
+                   smg.summary, smg.raw_text,
+                   (SELECT COUNT(*) FROM dealcloud.slack_message_group_file f
+                     WHERE f.message_group_id = smg.id) AS file_count,
+                   COUNT(*) OVER () AS total_matches
+              FROM dealcloud.slack_message_group smg
+              LEFT JOIN dealcloud.slack_channel sc ON sc.id = smg.channel_id
+             WHERE {' AND '.join(where)}
+             ORDER BY smg.last_ts::numeric DESC, smg.id DESC
+             LIMIT %s OFFSET %s
+            """,
+            [*params, inp.limit, inp.offset],
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        total = rows[0]["total_matches"] if rows else 0
+        ids = [r["conversation_id"] for r in rows]
+
+        orgs: dict[int, list] = {}
+        deals: dict[int, list] = {}
+        if ids:
+            cur.execute(
+                """
+                SELECT DISTINCT ON (oe.entity_id, o.id)
+                       oe.entity_id AS conversation_id, o.id AS org_id, o.name,
+                       oe.relationship_type
+                  FROM dealcloud.organization_entity oe
+                  JOIN dealcloud.organization o ON o.id = oe.organization_id
+                 WHERE oe.entity_type = 'slack_message_group' AND oe.entity_id = ANY(%s)
+                 ORDER BY oe.entity_id, o.id
+                """,
+                (ids,),
+            )
+            for o in cur.fetchall():
+                lst = orgs.setdefault(o["conversation_id"], [])
+                if len(lst) < _SLACK_SEARCH_ORG_CAP:
+                    lst.append({"org_id": o["org_id"], "name": o["name"],
+                                "relationship": o["relationship_type"]})
+            cur.execute(
+                """
+                SELECT sd.message_group_id AS conversation_id, d.id AS deal_id, d.name
+                  FROM dealcloud.slack_message_group_deal sd
+                  JOIN dealcloud.deal d ON d.id = sd.deal_id
+                 WHERE sd.message_group_id = ANY(%s)
+                 ORDER BY 1, 2
+                """,
+                (ids,),
+            )
+            for d in cur.fetchall():
+                deals.setdefault(d["conversation_id"], []).append(
+                    {"deal_id": d["deal_id"], "name": d["name"]})
+        coverage = _slack_coverage(cur)
+
+    results = []
+    for r in rows:
+        cid = r["conversation_id"]
+        summary = _slack_summary(r["summary"])
+        results.append({
+            "conversation_id":  cid,
+            "channel":          r["channel"],
+            "channel_archived": r["channel_archived"],
+            "is_thread":        r["is_thread"],
+            "first_message_at": r["first_message_at"],
+            "last_message_at":  r["last_message_at"],
+            "message_count":    r["message_count"],
+            "participants":     (r["participants"] or [])[:_SLACK_SEARCH_PEOPLE_CAP],
+            "summary_preview":  summary[:_SLACK_PREVIEW_CHARS]
+                                + ("..." if len(summary) > _SLACK_PREVIEW_CHARS else ""),
+            "match_snippet":    _slack_snippet(_slack_text(r["raw_text"]), terms)
+                                if terms else None,
+            "file_count":       r["file_count"],
+            "orgs":             orgs.get(cid, []),
+            "deals":            deals.get(cid, []),
+            "permalink":        r["permalink"],
+        })
+    return ToolResult(output={
+        "total_matches": total,
+        "returned": len(results),
+        "offset": inp.offset,
+        "results": results,
+        "note": _slack_note(coverage),
+    })
+
+
+@slack_registry.tool(
+    "read_slack_conversation",
+    (
+        "Open ONE internal Slack conversation: its VERBATIM messages "
+        "(timestamped, with who wrote each, @mentions resolved to names), "
+        "the LLM summary, channel, participants, the orgs and deals it "
+        "concerns with why, any files posted (with a summary and download "
+        "link), and the ids of the conversations just before and after it "
+        "in the same channel -- read those when this one starts or ends "
+        "mid-discussion. Use after search_slack_conversations or "
+        "get_org_dossier surfaces a conversation_id. Quote the messages "
+        "rather than paraphrasing when the wording matters, and attribute "
+        "each claim to whoever wrote it. CITING: link it as [#channel, "
+        "date](permalink). Read-only."
+    ),
+    SlackConversationIdInput,
+)
+def read_slack_conversation(inp: SlackConversationIdInput, ctx: dict) -> ToolResult:
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            f"""
+            SELECT smg.id AS conversation_id, smg.channel_id, smg.first_ts,
+                   sc.name AS channel, sc.purpose AS channel_purpose,
+                   sc.is_archived AS channel_archived,
+                   smg.thread_ts IS NOT NULL AS is_thread,
+                   to_timestamp(smg.first_ts::numeric) AS first_message_at,
+                   to_timestamp(smg.last_ts::numeric)  AS last_message_at,
+                   smg.message_count, smg.participants, smg.permalink,
+                   smg.summary, smg.raw_text
+              FROM dealcloud.slack_message_group smg
+              LEFT JOIN dealcloud.slack_channel sc ON sc.id = smg.channel_id
+             WHERE smg.id = %s AND {_SLACK_TS_OK}
+            """,
+            (inp.conversation_id,),
+        )
+        g = cur.fetchone()
+        if g is None:
+            return ToolResult(output=f"Slack conversation {inp.conversation_id} not found.")
+        g = dict(g)
+
+        cur.execute(
+            """
+            SELECT DISTINCT ON (o.id)
+                   o.id AS org_id, o.name, oe.relationship_type, oe.context
+              FROM dealcloud.organization_entity oe
+              JOIN dealcloud.organization o ON o.id = oe.organization_id
+             WHERE oe.entity_type = 'slack_message_group' AND oe.entity_id = %s
+             ORDER BY o.id, oe.context IS NULL
+            """,
+            (inp.conversation_id,),
+        )
+        linked_orgs = [dict(r) for r in cur.fetchall()]
+        cur.execute(
+            """
+            SELECT d.id AS deal_id, d.name, d.status
+              FROM dealcloud.slack_message_group_deal sd
+              JOIN dealcloud.deal d ON d.id = sd.deal_id
+             WHERE sd.message_group_id = %s
+             ORDER BY d.id
+            """,
+            (inp.conversation_id,),
+        )
+        linked_deals = [dict(r) for r in cur.fetchall()]
+        cur.execute(
+            """
+            SELECT file_name, mime_type, file_size, slack_url, download_url,
+                   LEFT(summary, %s) AS summary,
+                   COUNT(*) OVER () AS total
+              FROM dealcloud.slack_message_group_file
+             WHERE message_group_id = %s
+             ORDER BY id
+             LIMIT %s
+            """,
+            (_SLACK_PREVIEW_CHARS, inp.conversation_id, _SLACK_READ_FILE_CAP),
+        )
+        files = [dict(r) for r in cur.fetchall()]
+        # Neighbours by first_ts within the channel (the same key the
+        # indexer's UNIQUE (channel_id, first_ts) is on).
+        cur.execute(
+            f"""
+            SELECT (SELECT smg.id FROM dealcloud.slack_message_group smg
+                     WHERE smg.channel_id = %(ch)s AND {_SLACK_TS_OK}
+                       AND smg.first_ts::numeric < %(ts)s::numeric
+                     ORDER BY smg.first_ts::numeric DESC LIMIT 1) AS previous_id,
+                   (SELECT smg.id FROM dealcloud.slack_message_group smg
+                     WHERE smg.channel_id = %(ch)s AND {_SLACK_TS_OK}
+                       AND smg.first_ts::numeric > %(ts)s::numeric
+                     ORDER BY smg.first_ts::numeric LIMIT 1) AS next_id
+            """,
+            {"ch": g["channel_id"], "ts": g["first_ts"]},
+        )
+        nb = cur.fetchone()
+        coverage = _slack_coverage(cur)
+
+    text = _slack_text(g["raw_text"], resolve_names=True)
+    files_total = files[0]["total"] if files else 0
+    for f in files:
+        f.pop("total")
+    return ToolResult(output={
+        "conversation_id":  g["conversation_id"],
+        "channel":          g["channel"],
+        "channel_purpose":  g["channel_purpose"] or None,
+        "channel_archived": g["channel_archived"],
+        "is_thread":        g["is_thread"],
+        "first_message_at": g["first_message_at"],
+        "last_message_at":  g["last_message_at"],
+        "message_count":    g["message_count"],
+        "participants":     g["participants"] or [],
+        "summary":          _slack_summary(g["summary"]),
+        "messages":         text[:_SLACK_READ_TEXT_CAP] or "(no message text stored)",
+        "messages_truncated": len(text) > _SLACK_READ_TEXT_CAP,
+        "orgs":             linked_orgs,
+        "deals":            linked_deals,
+        "files":            files,
+        "files_omitted":    max(0, files_total - len(files)),
+        "previous_conversation_id": nb["previous_id"],
+        "next_conversation_id":     nb["next_id"],
+        "permalink":        g["permalink"],
+        "note":             _slack_note(coverage),
+    })
+
+
 def _call_dossier_fn(fn_name: str, org_ids: list[int]) -> ToolResult:
     """Invoke one of the dealcloud.org_* functions, returning the JSONB
     output as a Python dict. Centralised so tool handlers stay tiny."""

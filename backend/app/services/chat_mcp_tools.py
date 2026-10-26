@@ -300,6 +300,8 @@ MCP_INHERITED: frozenset[str] = frozenset({
     "find_email_contacts",
     "search_dealcloud_activities",
     "read_dealcloud_activity",
+    "search_slack_conversations",
+    "read_slack_conversation",
     "read_document_summary",
     "search_documents",
     "read_document",

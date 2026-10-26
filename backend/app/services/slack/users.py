@@ -49,6 +49,34 @@ def slack_user_to_email(slack_user_id: str) -> Optional[str]:
     return email
 
 
+# user_id -> display name, for rendering `<@U...>` mentions in stored
+# Slack text (read_slack_conversation). Same TTL/miss semantics as _CACHE.
+_NAME_CACHE: dict[str, tuple[str | None, float]] = {}
+
+
+def slack_user_display_name(slack_user_id: str) -> Optional[str]:
+    """The user's real name (falling back to display name), or None when
+    there's no bot token or the lookup fails -- never raises."""
+    cached = _NAME_CACHE.get(slack_user_id)
+    if cached and time.time() - cached[1] < _TTL_SECONDS:
+        return cached[0]
+
+    if _CLIENT is None:
+        return None
+
+    try:
+        user = _CLIENT.users_info(user=slack_user_id)["user"]
+        profile = user.get("profile", {})
+        name = (profile.get("real_name") or user.get("real_name")
+                or profile.get("display_name") or user.get("name")) or None
+    except Exception as e:  # noqa: BLE001 - fail soft, see docstring
+        logger.info("slack_user_display_name: lookup failed for %s: %s", slack_user_id, e)
+        name = None
+
+    _NAME_CACHE[slack_user_id] = (name, time.time())
+    return name
+
+
 def is_ion_email(email: str | None) -> bool:
     return bool(email) and email.lower().endswith("@ionpacific.com")
 
