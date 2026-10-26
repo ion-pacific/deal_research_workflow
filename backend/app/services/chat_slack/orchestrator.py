@@ -107,6 +107,16 @@ keywords in subject AND the Notes / body. Use for "what did we hear on \
 the last call with X", "what notes do we have on Y".
 - `read_dealcloud_activity(activity_id)` -- one activity's full Notes (or \
 filed email's body), attendees, linked orgs and deals.
+- `search_slack_conversations(query?, org_ids?, deal_ids?, channel?, \
+participant?, since?, until?)` -- search Ion's own internal SLACK \
+conversations (public channels), matching keywords in the VERBATIM \
+messages. Use for "what has the team said about X", "who flagged Y on \
+Slack", "what's been discussed in #<channel>". Search by the company's \
+name as `query` too -- only about half of conversations are linked to \
+an org, so org_ids alone misses many.
+- `read_slack_conversation(conversation_id)` -- one conversation's full \
+verbatim messages, summary, linked orgs/deals, files posted, and the \
+neighbouring conversations in that channel.
 - `read_document_summary(document_id)` -- LLM summary of one document. \
 Use after get_org_dossier or search_documents surfaces a relevant doc id.
 - `search_documents(query, org_ids, limit=10)` -- find docs BY TOPIC \
