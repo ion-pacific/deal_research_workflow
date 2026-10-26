@@ -2995,6 +2995,13 @@ def _slack_text(raw: str | None, resolve_names: bool = False) -> str:
     return html.unescape(text)
 
 
+def _slack_summary(summary: str | None) -> str:
+    """dce's scanner stores a failed LLM call as a marker, not NULL."""
+    if not summary or summary in ("[llm_failed]", "[scan_failed]"):
+        return "(no summary -- read the messages)"
+    return summary
+
+
 def _slack_snippet(text: str, terms: list[str]) -> str | None:
     """~400 chars of the verbatim text around the first term that occurs."""
     low = text.lower()
@@ -3220,7 +3227,7 @@ def search_slack_conversations(inp: SearchSlackInput, ctx: dict) -> ToolResult:
     results = []
     for r in rows:
         cid = r["conversation_id"]
-        summary = r["summary"] or ""
+        summary = _slack_summary(r["summary"])
         results.append({
             "conversation_id":  cid,
             "channel":          r["channel"],
@@ -3357,7 +3364,7 @@ def read_slack_conversation(inp: SlackConversationIdInput, ctx: dict) -> ToolRes
         "last_message_at":  g["last_message_at"],
         "message_count":    g["message_count"],
         "participants":     g["participants"] or [],
-        "summary":          g["summary"] or "(no summary)",
+        "summary":          _slack_summary(g["summary"]),
         "messages":         text[:_SLACK_READ_TEXT_CAP] or "(no message text stored)",
         "messages_truncated": len(text) > _SLACK_READ_TEXT_CAP,
         "orgs":             linked_orgs,
