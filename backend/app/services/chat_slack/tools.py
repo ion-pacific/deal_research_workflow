@@ -3793,6 +3793,32 @@ def _format_doc_matches(rows: list[dict], text: str) -> str:
     return "\n".join(lines)
 
 
+#: How many out-of-room matches a room miss names. The point of naming any
+#: is "not in this room" != "does not exist", and the COUNT carries that.
+#: The full list does not: a generic word ("valuation", "term sheet")
+#: matches 200 paths across every deal in the firm, ~30 KB per miss, and an
+#: agent probing three names in one round put ~99 KB of other deals' paths
+#: into its context (exit modeler, TBC room, 2026-10-28).
+_ELSEWHERE_SHOWN = 5
+
+
+def _nearest_to_folder(rows: list[dict], folder: str) -> list[dict]:
+    """`rows` re-ordered so paths sharing the longest leading folder run with
+    `folder` come first -- a file one level outside the room is the likely
+    one, not a namesake in another deal. Stable, so ties keep index order."""
+    want = [p for p in (folder or "").lower().split("/") if p]
+
+    def shared(r: dict) -> int:
+        n = 0
+        for a, b in zip(want, (r.get("path") or "").lower().split("/")):
+            if a != b:
+                break
+            n += 1
+        return n
+
+    return sorted(rows, key=lambda r: -shared(r))
+
+
 def _join_parts(parts: list[str]) -> str:
     return "\n\n".join(p for p in parts if p)
 
@@ -4012,6 +4038,7 @@ def find_documents_by_name(
         if job is None:
             return ToolResult(output=f"No data room build job {inp.job_id}.")
         doc_ids = job.doc_ids or []
+        room_folder = job.folder_path or ""
         scope = f"data room job {inp.job_id} ({len(doc_ids)} documents)"
         if not doc_ids:
             return ToolResult(output=(
@@ -4032,11 +4059,26 @@ def find_documents_by_name(
             # exist" about a file sitting one folder outside the room.
             elsewhere = _find_docs_by_path(inp.path_or_name)
             if elsewhere:
-                shown = _format_doc_matches(elsewhere, inp.path_or_name)
+                n = len(elsewhere)
+                count = f"{n}+" if n >= _PATH_MATCH_LIMIT else str(n)
+                near = _nearest_to_folder(elsewhere, room_folder)
+                lines = [
+                    f"- [{r['id']}] {r['path']}"
+                    + ("" if r["readable"] else "  [indexed, not yet read]")
+                    for r in near[:_ELSEWHERE_SHOWN]
+                ]
+                rest = n - len(lines)
+                tail = (
+                    f"\n({rest} more not shown -- most likely other deals. "
+                    f"Call find_documents_by_name WITHOUT job_id to list "
+                    f"them, ideally with a more specific name.)"
+                    if rest > 0 else ""
+                )
                 return ToolResult(output=(
                     f"{msg} It does exist outside this room, though -- "
-                    f"{len(elsewhere)} match(es) elsewhere in the document "
-                    f"index:\n{shown}"
+                    f"{count} match(es) elsewhere in the document index. "
+                    f"Closest to this room's folder:\n" + "\n".join(lines)
+                    + tail
                 ))
         return ToolResult(output=(
             msg + " If the file was added to SharePoint very recently, "
