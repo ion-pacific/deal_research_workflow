@@ -548,9 +548,20 @@ def mcp_ask_data_room(inp: McpAskDataRoomInput, ctx: dict) -> ToolResult:
 
     if inp.question:
         try:
-            parts.append(retrieve_room_context_for_docs(doc_ids, inp.question))
+            retrieved = retrieve_room_context_for_docs(doc_ids, inp.question)
         except _ClaudeRoomError as e:
             return ToolResult(output=f"Data room retrieval error: {e}")
+        # ★★ retrieve_room_context_for_docs returns a DICT (question,
+        # instructions, documents, sources -- since 86825ad), not text.
+        # Joining it into `parts` raised "sequence item 0: expected str
+        # instance, dict found" on EVERY question that retrieved anything,
+        # from 1de31c8 (2026-09-30) until this fix. Keep the structured
+        # payload -- the adapter JSON-encodes it, and the client relies on
+        # `instructions` and `sources` as fields -- and carry the build note
+        # and filename matches alongside it, first, so they are read first.
+        notes = [p for p in parts if p]
+        return ToolResult(output=({"notes": notes, **retrieved} if notes
+                                  else retrieved))
     return ToolResult(output=("\n\n".join(p for p in parts if p)))
 
 
