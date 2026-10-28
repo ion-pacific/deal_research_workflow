@@ -38,8 +38,53 @@ def _get_pool() -> _pg_pool.ThreadedConnectionPool:
                     minconn=settings.db_pool_min,
                     maxconn=settings.db_pool_max,
                     dsn=settings.database_url,
+                    # TCP keepalives, so an idle pooled conn is kept alive
+                    # (or noticed dead) by the OS instead of being silently
+                    # dropped by Neon / the network and discovered only
+                    # when the next caller's first statement hits it.
+                    **_KEEPALIVES,
                 )
     return _pool
+
+
+_KEEPALIVES = dict(keepalives=1, keepalives_idle=30,
+                   keepalives_interval=10, keepalives_count=3)
+
+#: How many dead pooled conns one checkout will discard before giving up.
+_CHECKOUT_ATTEMPTS = 3
+
+
+def _checkout(pool):
+    """A pooled conn that has PROVEN it is alive, with session settings
+    applied.
+
+    ★★ `conn.closed` is not a liveness check. psycopg2 only sets it AFTER an
+    operation fails, so a conn whose socket Neon (or the network) dropped
+    while it sat idle in the pool still reads as open -- and the first
+    statement on it raised "SSL SYSCALL error: EOF detected" straight into
+    whatever tool asked for it (seen live on MCP ask_data_room, 2026-10-28).
+
+    `_prepare`'s `SET search_path` is that first statement, and it runs
+    before the caller has done anything, so failing it is free to retry:
+    discard the dead conn and take another. Only connection-level errors
+    are retried; anything else is a real problem and is raised."""
+    for attempt in range(_CHECKOUT_ATTEMPTS):
+        conn = pool.getconn()
+        try:
+            if conn.closed:
+                raise psycopg2.InterfaceError("pooled connection already closed")
+            _prepare(conn)
+            return conn
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            try:
+                pool.putconn(conn, close=True)
+            except Exception:
+                pass
+            if attempt == _CHECKOUT_ATTEMPTS - 1:
+                raise
+        except Exception:
+            pool.putconn(conn, close=True)
+            raise
 
 
 def _prepare(conn) -> None:
@@ -57,16 +102,9 @@ def get_conn():
     rolls back and discards on exception so the pool never reuses a
     broken conn."""
     pool = _get_pool()
-    conn = pool.getconn()
-    # If the pool handed back a closed conn (e.g. Neon idle-killed it),
-    # discard and ask again. One retry is enough; if we still get closed
-    # something else is wrong and the next op will raise.
-    if conn.closed:
-        pool.putconn(conn, close=True)
-        conn = pool.getconn()
+    conn = _checkout(pool)
     poisoned = False
     try:
-        _prepare(conn)
         yield conn
         conn.commit()
     except Exception:
