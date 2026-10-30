@@ -1,4 +1,4 @@
-"""External web tools for chat. Backed by Gemini 2.5 Pro with Google
+"""External web tools for chat. Backed by Gemini 3.1 Pro with Google
 Search grounding -- same pattern slack_helper/run_ai_updates.py uses for
 the AI news digest.
 
@@ -52,7 +52,9 @@ logger = logging.getLogger(__name__)
 # `web_search` server-tool, and we already depend on it for slack_helper.
 # Pro because we want the same quality bar as the consolidation work that
 # validated Pro >> Flash Lite > Sonnet for grounded judgement tasks.
-GEMINI_MODEL = "gemini-2.5-pro"
+# gemini-2.5-pro was retired by Google (2026-10); 3.1 Pro is its named
+# successor and is preview-only -- there is no stable 3.x Pro yet.
+GEMINI_MODEL = "gemini-3.1-pro-preview"
 
 # How many grounding chunks (URL + title pairs) to surface to Claude.
 # Keep it tight -- Claude only needs enough to cite, not a wall of refs.
@@ -115,7 +117,8 @@ def _grounded_call(prompt: str, *, max_sources: int) -> tuple[str, list[dict], d
     empty. Every failure is reported to the model as data (never raised)
     so a web hiccup degrades to "answer from internal data" instead of
     killing the turn."""
-    if not settings.gemini_api_key:
+    api_key = settings.gemini_api_key_billed or settings.gemini_api_key
+    if not api_key:
         return "", [], {
             "error": "Web search is not configured on this server "
                      "(GEMINI_API_KEY missing). Tell the user external "
@@ -138,13 +141,13 @@ def _grounded_call(prompt: str, *, max_sources: int) -> tuple[str, list[dict], d
         # timeout beats no web search.
         try:
             client = genai.Client(
-                api_key=settings.gemini_api_key,
+                api_key=api_key,
                 http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS),
             )
         except Exception:
             logger.warning("HttpOptions(timeout=...) unsupported; "
                            "falling back to no request timeout")
-            client = genai.Client(api_key=settings.gemini_api_key)
+            client = genai.Client(api_key=api_key)
         response = client.models.generate_content(
             model=GEMINI_MODEL,
             contents=prompt,

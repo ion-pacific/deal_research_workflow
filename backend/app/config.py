@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     # grounding). Empty value forces the tool to return a friendly
     # "not configured" message rather than 500ing.
     gemini_api_key: str = ""
+    # Corp-billed Gemini key; preferred over gemini_api_key when set. The
+    # old key is free-tier and has NO allowance (`limit: 0`) on Pro-class
+    # models, so the grounded web tools only work on this one.
+    gemini_api_key_billed: str = ""
 
     # deal_cloud_enhancer internal API -- shared secret + base URL for
     # the /internal/document-body/{id} endpoint that triggers lazy
