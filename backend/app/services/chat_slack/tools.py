@@ -223,7 +223,12 @@ def bundle_via_supersede(inp: OrgIdsInput, ctx: dict) -> ToolResult:
         "the deal's main counterparty), `as_underlying` (deals where the "
         "org is an underlying portfolio company, including LLM-derived "
         "links from IC memos), and `doc_only_underlying_hints` (looser "
-        "signal: docs co-mentioning the org with a known DC counterparty). "
+        "signal: docs co-mentioning the org with a known DC counterparty), "
+        "and `via_counterparty_manager_portfolio` (the org is in the "
+        "portfolio of a fund manager that is the counterparty of a deal we "
+        "hold, taken from that manager's OTHER deals -- often a different "
+        "vintage, so it is NOT counted in `in_portfolio`: report it as "
+        "possible indirect exposure to verify, never as a holding). "
         "Restricted to deal.status IN ('Portfolio Company', 'Partnership')."
     ),
     OrgIdsInput,
