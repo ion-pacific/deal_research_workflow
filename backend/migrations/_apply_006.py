@@ -12,7 +12,11 @@ import psycopg2
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent
-load_dotenv(ROOT.parent.parent.parent / "deal_cloud_enhancer" / ".env")
+# Walk up so this also works from a git worktree (one level deeper).
+for parent in ROOT.parents:
+    if (parent / "deal_cloud_enhancer" / ".env").exists():
+        load_dotenv(parent / "deal_cloud_enhancer" / ".env")
+        break
 
 sql = (ROOT / "006_portfolio_via_manager.sql").read_text(encoding="utf-8")
 
