@@ -12,6 +12,7 @@ import DealOnePagerPage from "./routes/DealOnePagerPage";
 import OnePagersListPage from "./routes/OnePagersListPage";
 import ResearchPage from "./routes/ResearchPage";
 import SessionsListPage from "./routes/SessionsListPage";
+import { ENTRA_ENABLED, signOut } from "./lib/auth";
 import { useUI } from "./stores/ui";
 
 /** Segmented-control tab: the active tab is a raised white block on the
@@ -85,8 +86,13 @@ function UserStrip() {
   }
 
   const onLogout = () => {
-    setUserEmail("");
     qc.clear();
+    if (ENTRA_ENABLED) {
+      // Ends the Microsoft session too; redirects back to the app's origin.
+      void signOut();
+      return;
+    }
+    setUserEmail("");
     navigate("/");
   };
 

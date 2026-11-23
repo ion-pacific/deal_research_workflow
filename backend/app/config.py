@@ -20,6 +20,20 @@ class Settings(BaseSettings):
     azure_tenant_id: str = ""
     flask_secret_key: str = ""
 
+    # /api/v1 user auth -- see app/auth.py. stub | both | entra.
+    # Default stays 'stub' so local dev keeps working; production must
+    # set 'entra' (or 'both' during the frontend rollout).
+    auth_mode: str = "stub"
+    # Accepted `aud` values (comma-separated). Blank = api://<client_id>
+    # and the bare client id.
+    entra_api_audience: str = ""
+    # Delegated scope the frontend requests (Expose an API -> scope name).
+    entra_required_scope: str = "access_as_user"
+    allowed_email_domain: str = "ionpacific.com"
+    # Serve /docs, /redoc and /openapi.json. Turn OFF in production --
+    # the full schema is a map of every endpoint for an attacker.
+    expose_api_docs: bool = True
+
     # Todd the Walrus -- Slack app credentials. Empty in local dev means
     # the Slack endpoints will refuse signed requests (good: prevents
     # accidental staging access without proper config).
