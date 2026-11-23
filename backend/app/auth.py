@@ -76,6 +76,19 @@ def _jwks_client() -> jwt.PyJWKClient:
     )
 
 
+def _reject_log(reason: str, token: str) -> None:
+    """Log why a token was rejected plus a few UNVERIFIED claims that
+    explain mismatches (iss/aud/ver/scp). Never logs the token itself.
+    print(), not logging: uvicorn's default config drops INFO from app
+    loggers (same convention as main.py's warmup)."""
+    try:
+        c = jwt.decode(token, options={"verify_signature": False})
+        hint = {k: c.get(k) for k in ("iss", "aud", "ver", "scp", "tid", "appid", "azp")}
+    except Exception:
+        hint = "undecodable"
+    print(f"[auth] rejected bearer: {reason} | claims={hint}", flush=True)
+
+
 def verify_entra_token(token: str) -> UserCtx:
     """Validate an Entra v2 access token for this API; return the user.
     Raises HTTPException(401) on any failure."""
@@ -91,29 +104,39 @@ def verify_entra_token(token: str) -> UserCtx:
             key,
             algorithms=["RS256"],
             audience=audiences,
-            issuer=f"https://login.microsoftonline.com/{tenant}/v2.0",
+            # v2 tokens, and v1 tokens (issued for an API whose manifest
+            # leaves requestedAccessTokenVersion unset) -- same tenant,
+            # same signing keys. Nothing from another tenant passes.
+            issuer=[
+                f"https://login.microsoftonline.com/{tenant}/v2.0",
+                f"https://sts.windows.net/{tenant}/",
+            ],
             options={"require": ["exp", "iat", "iss", "aud"]},
             leeway=60,
         )
     except jwt.PyJWTError as e:
-        log.info("Rejected bearer token: %s: %s", type(e).__name__, e)
+        _reject_log(f"{type(e).__name__}: {e}", token)
         raise _unauthorized("Invalid or expired token.") from e
 
     if claims.get("tid") != tenant:
+        _reject_log("wrong tid", token)
         raise _unauthorized("Token is from another tenant.")
 
     required = settings.entra_required_scope
     if required and required not in (claims.get("scp") or "").split():
+        _reject_log(f"missing scope {required!r}", token)
         raise _unauthorized(f"Token lacks the '{required}' scope.")
 
     email = (
-        claims.get("preferred_username")
+        claims.get("preferred_username")       # v2
+        or claims.get("upn")                   # v1 (members)
+        or claims.get("unique_name")           # v1 fallback
         or claims.get("email")
-        or claims.get("upn")
         or ""
     ).lower().strip()
     domain = settings.allowed_email_domain.lower().lstrip("@")
     if not email or (domain and not email.endswith("@" + domain)):
+        _reject_log("email not allowed", token)
         raise _unauthorized("Account is not allowed to use this app.")
 
     return UserCtx(email=email, name=claims.get("name"))

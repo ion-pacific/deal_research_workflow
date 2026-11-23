@@ -139,3 +139,33 @@ def test_non_bearer_scheme_rejected(monkeypatch):
 def test_unconfigured_tenant_rejects(monkeypatch):
     monkeypatch.setattr(settings, "azure_tenant_id", "")
     _rejects("entra", monkeypatch, authorization=f"Bearer {_token()}")
+
+
+# --- v1 access tokens (manifest requestedAccessTokenVersion unset) --------
+
+def _v1(**over):
+    base = {"iss": f"https://sts.windows.net/{TENANT}/", "preferred_username": None,
+            "upn": "Analyst@ionpacific.com", "ver": "1.0"}
+    base.update(over)
+    return _token(**base)
+
+
+def test_v1_token_accepted_with_upn(monkeypatch):
+    u = _call("entra", monkeypatch, authorization=f"Bearer {_v1()}")
+    assert u.email == "analyst@ionpacific.com"
+
+
+def test_v1_unique_name_fallback(monkeypatch):
+    t = _v1(upn=None, unique_name="analyst@ionpacific.com")
+    assert _call("entra", monkeypatch, authorization=f"Bearer {t}").email == "analyst@ionpacific.com"
+
+
+def test_v1_issuer_of_other_tenant_rejected(monkeypatch):
+    _rejects("entra", monkeypatch, authorization=f"Bearer {_v1(iss='https://sts.windows.net/evil/')}")
+
+
+def test_rejection_is_logged_without_token(monkeypatch, capsys):
+    t = _token(aud="api://someone-else")
+    _rejects("entra", monkeypatch, authorization=f"Bearer {t}")
+    out = capsys.readouterr().out
+    assert "[auth] rejected bearer" in out and "api://someone-else" in out and t not in out
