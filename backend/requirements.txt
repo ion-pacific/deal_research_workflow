@@ -8,7 +8,7 @@ anthropic>=0.42
 sse-starlette>=2.1
 python-multipart>=0.0.12
 # Entra ID access-token validation for /api/v1 (app/auth.py).
-PyJWT[crypto]>=2.8
+PyJWT[crypto]>=2.10
 slack-sdk>=3.31
 openpyxl>=3.1
 google-genai>=0.3
