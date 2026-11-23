@@ -28,6 +28,9 @@ app = FastAPI(
     title="deal_research_workflow API",
     version="0.0.1",
     description="Backend for the deal-research workflow app. See README.",
+    docs_url="/docs" if settings.expose_api_docs else None,
+    redoc_url="/redoc" if settings.expose_api_docs else None,
+    openapi_url="/openapi.json" if settings.expose_api_docs else None,
 )
 
 if settings.origin_list:

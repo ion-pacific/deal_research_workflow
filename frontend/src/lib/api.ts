@@ -1,13 +1,12 @@
-import { useUI } from "../stores/ui";
+import { authHeaders } from "./auth";
 
 const BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? "";
 
-/** Thin fetch wrapper that injects the V0 stub auth header. */
+/** Thin fetch wrapper that injects the user's credentials (see lib/auth.ts). */
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const email = useUI.getState().userEmail;
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
-  if (email) headers.set("X-User-Email", email);
+  for (const [k, v] of Object.entries(await authHeaders())) headers.set(k, v);
   const res = await fetch(`${BASE}${path}`, { ...init, headers });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
@@ -883,11 +882,10 @@ export interface ChatStreamRequest {
 }
 
 export async function streamChat(req: ChatStreamRequest): Promise<void> {
-  const email = useUI.getState().userEmail;
   const headers = new Headers();
   headers.set("Content-Type", "application/json");
   headers.set("Accept", "text/event-stream");
-  if (email) headers.set("X-User-Email", email);
+  for (const [k, v] of Object.entries(await authHeaders())) headers.set(k, v);
 
   const res = await fetch(`${BASE}/api/v1/sessions/${req.sessionId}/chat`, {
     method: "POST",
